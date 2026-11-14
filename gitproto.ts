@@ -113,6 +113,7 @@ function v0Advertisement(repo: RepoRec, service: string): Buffer {
   const names = sortedRefNames(repo);
   if (names.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    parts.push(PKT_FLUSH);
     return Buffer.concat(parts);
   }
   const headOid = repo.refs.get(headTarget(repo)) ?? ZERO_OID;
@@ -126,6 +127,7 @@ function v0Advertisement(repo: RepoRec, service: string): Buffer {
       if (peeled !== null && peeled.type === 'commit') parts.push(pktLine(`${peeled.oid} ${name}^{}\n`));
     }
   }
+  parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
 }
 
@@ -202,6 +204,7 @@ interface FetchRequest {
   deepenSince: number | null;
   deepenNot: string[];
   done: boolean;
+  waitForDone: boolean;
 }
 
 interface FetchPlan {
@@ -326,24 +329,40 @@ function resolveRef(repo: RepoRec, value: string): string | null {
 function fetchResponseV2(repo: RepoRec, request: FetchRequest): Buffer {
   const plan = planFetch(repo, request);
   const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
-  if (request.done) {
-    if (plan.commonHaves.length > 0) {
-      for (const oid of plan.commonHaves) parts.push(pktLine(`ACK ${oid}\n`));
-    } else {
-      parts.push(pktLine('NAK\n'));
-    }
-  } else {
-    if (plan.commonHaves.length > 0) {
+  // The acknowledgments section answers 'have' lines; when the client sent none (a fresh
+  // clone), the response must open with shallow-info or packfile directly — real git
+  // rejects an acknowledgments section it never negotiated. The same applies to the
+  // closing request of a multi-round negotiation, which carries 'done' and no wants
+  // after the server already said 'ready': git then expects the packfile, not more acks.
+  const closingRequest = request.done && request.wants.length === 0;
+  if (request.haves.length > 0 && !closingRequest) {
+    parts.push(pktLine('acknowledgments\n'));
+    if (request.done) {
+      if (plan.commonHaves.length > 0) {
+        for (const oid of plan.commonHaves) parts.push(pktLine(`ACK ${oid}\n`));
+      } else {
+        parts.push(pktLine('NAK\n'));
+      }
+    } else if (plan.commonHaves.length > 0) {
       for (const oid of plan.commonHaves) parts.push(pktLine(`ACK ${oid}\n`));
       parts.push(pktLine('ready\n'));
+      if (request.waitForDone) {
+        // The client asked to close the negotiation itself: it will send a final
+        // done-only request, answered with the packfile alone (the closingRequest path).
+        parts.push(PKT_FLUSH);
+        return Buffer.concat(parts);
+      }
+      // Otherwise 'ready' means the packfile sections follow in THIS response — git's
+      // fetch-pack dies with "expected packfile to be sent after 'ready'" if they do not.
     } else {
+      // Nothing in common yet and the client is still negotiating: NAK and let it offer
+      // more haves in the next round.
       parts.push(pktLine('NAK\n'));
+      parts.push(PKT_FLUSH);
+      return Buffer.concat(parts);
     }
-    parts.push(PKT_FLUSH);
-    return Buffer.concat(parts);
+    parts.push(PKT_DELIM);
   }
-  parts.push(PKT_DELIM);
   if (plan.boundary.length > 0 || plan.unshallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
     for (const oid of plan.boundary) parts.push(pktLine(`shallow ${oid}\n`));
@@ -419,7 +438,7 @@ async function handleUploadPack(ctx: Ctx, repo: RepoRec): Promise<void> {
       return;
     }
     if (command === 'fetch') {
-      const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [], done: false };
+      const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [], done: false, waitForDone: false };
       for (const arg of args) {
         if (arg.startsWith('want ')) request.wants.push(arg.slice(5).trim());
         else if (arg.startsWith('have ')) request.haves.push(arg.slice(5).trim());
@@ -428,6 +447,7 @@ async function handleUploadPack(ctx: Ctx, repo: RepoRec): Promise<void> {
         else if (arg.startsWith('deepen-since ')) request.deepenSince = Number(arg.slice(13).trim());
         else if (arg.startsWith('deepen-not ')) request.deepenNot.push(arg.slice(11).trim());
         else if (arg === 'done') request.done = true;
+        else if (arg === 'wait-for-done') request.waitForDone = true;
       }
       sendBuffer(ctx.res, 200, fetchResponseV2(repo, request), 'application/x-git-upload-pack-result');
       return;
@@ -437,7 +457,7 @@ async function handleUploadPack(ctx: Ctx, repo: RepoRec): Promise<void> {
   }
 
   // v0: section one is wants and deepen lines, section two is haves and done.
-  const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [], done: false };
+  const request: FetchRequest = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [], done: false, waitForDone: false };
   let sideband = false;
   let section = 1;
   for (const packet of decoded.packets) {
@@ -529,7 +549,9 @@ async function handleReceivePack(ctx: Ctx, repo: RepoRec): Promise<void> {
   if (reportStatus) {
     const inner = reportLines.map((line) => pktLine(`${line}\n`));
     if (sideband) {
-      const wrapped = inner.map((packet) => pktLine(Buffer.concat([Buffer.from([1]), packet])));
+      // The report is itself a pkt-line stream carried inside band 1: it ends with its own
+      // flush packet (also wrapped) before the outer flush closes the response.
+      const wrapped = [...inner, PKT_FLUSH].map((packet) => pktLine(Buffer.concat([Buffer.from([1]), packet])));
       responseBody = Buffer.concat([...wrapped, PKT_FLUSH]);
     } else {
       responseBody = Buffer.concat([...inner, PKT_FLUSH]);
