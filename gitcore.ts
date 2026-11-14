@@ -221,7 +221,9 @@ function inflateAt(buffer: Buffer, offset: number): Promise<{ data: Buffer; cons
     stream.on('end', () => {
       if (!settled) {
         settled = true;
-        const consumed = (stream as unknown as { bytesRead?: number }).bytesRead ?? 0;
+        // The zlib engine stops consuming at its stream's end: bytesWritten is the exact
+        // number of input bytes this entry used, which is where the next entry begins.
+        const consumed = (stream as unknown as { bytesWritten?: number }).bytesWritten ?? 0;
         resolve({ data: Buffer.concat(chunks), consumed });
       }
     });

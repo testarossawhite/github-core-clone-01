@@ -191,6 +191,27 @@ export function repoKey(owner: string, name: string): string {
   return `${owner}/${name}`;
 }
 
+// ------------------------------------------------------------------ global (Relay) ids
+
+/** An opaque global id for a forge object: base64 of `Type:key`, never the plain numeric id. */
+export function globalId(type: string, key: string): string {
+  return Buffer.from(`${type}:${key}`, 'utf8').toString('base64');
+}
+
+/** Decode a global id back into its type and key; null when the value is not one of ours. */
+export function parseGlobalId(id: string): { type: string; key: string } | null {
+  if (typeof id !== 'string' || id === '') return null;
+  let text: string;
+  try {
+    text = Buffer.from(id, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+  const colon = text.indexOf(':');
+  if (colon <= 0) return null;
+  return { type: text.slice(0, colon), key: text.slice(colon + 1) };
+}
+
 // ------------------------------------------------------------------ object store helpers
 
 export function putObject(repo: RepoRec, type: ObjType, data: Buffer): string {
